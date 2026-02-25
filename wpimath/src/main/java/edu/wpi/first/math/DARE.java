@@ -4,14 +4,12 @@
 
 package edu.wpi.first.math;
 
-import org.ejml.data.Complex_F64;
 import org.ejml.data.DMatrixRMaj;
 import org.ejml.dense.row.CommonOps_DDRM;
 import org.ejml.dense.row.NormOps_DDRM;
 import org.ejml.dense.row.factory.DecompositionFactory_DDRM;
 import org.ejml.interfaces.decomposition.CholeskyDecomposition_F64;
 import org.ejml.interfaces.decomposition.EigenDecomposition_F64;
-import org.ejml.interfaces.decomposition.SingularValueDecomposition_F64;
 import org.ejml.simple.SimpleMatrix;
 
 /** DARE solver utility functions. */
@@ -341,7 +339,7 @@ public final class DARE {
   }
 
   private static void checkStabilizability(DMatrixRMaj A, DMatrixRMaj B) {
-    if (!isStabilizable(A, B)) {
+    if (!StateSpaceUtil.isStabilizable(A, B)) {
       throw new IllegalArgumentException("The (A, B) pair is not stabilizable.");
     }
   }
@@ -373,128 +371,10 @@ public final class DARE {
     DMatrixRMaj CT = new DMatrixRMaj(n, n);
     CommonOps_DDRM.transpose(C, CT);
 
-    if (!isStabilizable(AT, CT)) {
+    if (!StateSpaceUtil.isStabilizable(AT, CT)) {
       throw new IllegalArgumentException(
           "The (A, C) pair where Q = CᵀC is not detectable.");
     }
-  }
-
-  /**
-   * Returns true if (A, B) is a stabilizable pair.
-   *
-   * <p>Uses a real-arithmetic PBH rank test. For each eigenvalue λ = a+bi of A with |λ|² ≥ 1,
-   * builds the real block matrix:
-   *
-   * <pre>
-   * M = [ (aI−A)ᵀ   b·I       ]  ← n rows
-   *     [ b·I      −(aI−A)ᵀ   ]  ← n rows
-   *     [ Bᵀ        0          ]  ← m rows
-   *     [ 0         Bᵀ         ]  ← m rows
-   * </pre>
-   *
-   * and checks rank(M) = 2n. If any unstable eigenvalue yields rank(M) < 2n, the pair is not
-   * stabilizable.
-   */
-  private static boolean isStabilizable(DMatrixRMaj A, DMatrixRMaj B) {
-    int n = A.numRows;
-    int m = B.numCols;
-
-    // Eigenvalues of A (non-symmetric, no vectors needed)
-    EigenDecomposition_F64<DMatrixRMaj> eig = DecompositionFactory_DDRM.eig(n, false);
-    eig.decompose(A.copy());
-
-    // Precompute Bᵀ (m × n)
-    DMatrixRMaj BT = new DMatrixRMaj(m, n);
-    CommonOps_DDRM.transpose(B, BT);
-
-    for (int i = 0; i < n; i++) {
-      Complex_F64 ev = eig.getEigenvalue(i);
-      double a = ev.real;
-      double b = ev.imaginary;
-
-      // Skip stable eigenvalues (|λ|² < 1)
-      if (a * a + b * b < 1.0) {
-        continue;
-      }
-
-      // aI − A
-      DMatrixRMaj aIA = CommonOps_DDRM.identity(n);
-      CommonOps_DDRM.scale(a, aIA);
-      CommonOps_DDRM.subtractEquals(aIA, A);
-
-      // (aI−A)ᵀ
-      DMatrixRMaj aIAT = new DMatrixRMaj(n, n);
-      CommonOps_DDRM.transpose(aIA, aIAT);
-
-      // Build M of size (2n+2m) × 2n
-      int rows = 2 * n + 2 * m;
-      int cols = 2 * n;
-      DMatrixRMaj M = new DMatrixRMaj(rows, cols);
-
-      // Row block 0 (rows 0..n-1): [ (aI−A)ᵀ  |  b·I ]
-      for (int r = 0; r < n; r++) {
-        for (int c = 0; c < n; c++) {
-          M.set(r, c, aIAT.get(r, c));
-        }
-        M.set(r, n + r, b);
-      }
-
-      // Row block 1 (rows n..2n-1): [ b·I  |  −(aI−A)ᵀ ]
-      for (int r = 0; r < n; r++) {
-        M.set(n + r, r, b);
-        for (int c = 0; c < n; c++) {
-          M.set(n + r, n + c, -aIAT.get(r, c));
-        }
-      }
-
-      // Row block 2 (rows 2n..2n+m-1): [ Bᵀ  |  0 ]
-      for (int r = 0; r < m; r++) {
-        for (int c = 0; c < n; c++) {
-          M.set(2 * n + r, c, BT.get(r, c));
-        }
-      }
-
-      // Row block 3 (rows 2n+m..2n+2m-1): [ 0  |  Bᵀ ]
-      for (int r = 0; r < m; r++) {
-        for (int c = 0; c < n; c++) {
-          M.set(2 * n + m + r, n + c, BT.get(r, c));
-        }
-      }
-
-      if (computeRank(M) < 2 * n) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  /**
-   * Computes the rank of a matrix via SVD. Uses a relative threshold of 1e-10 × max singular
-   * value.
-   */
-  private static int computeRank(DMatrixRMaj M) {
-    SingularValueDecomposition_F64<DMatrixRMaj> svd =
-        DecompositionFactory_DDRM.svd(M.numRows, M.numCols, false, false, false);
-    svd.decompose(M.copy());
-
-    int numSV = svd.numberOfSingularValues();
-    double[] sv = svd.getSingularValues();
-
-    double maxSV = 0.0;
-    for (int i = 0; i < numSV; i++) {
-      if (sv[i] > maxSV) {
-        maxSV = sv[i];
-      }
-    }
-
-    double tol = 1e-10 * maxSV;
-    int rank = 0;
-    for (int i = 0; i < numSV; i++) {
-      if (sv[i] > tol) {
-        rank++;
-      }
-    }
-    return rank;
   }
 
   /**

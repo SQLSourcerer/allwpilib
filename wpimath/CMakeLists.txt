@@ -11,7 +11,6 @@ file(
     src/main/native/cpp/jni/Ellipse2dJNI.cpp
     src/main/native/cpp/jni/Exceptions.cpp
     src/main/native/cpp/jni/Pose3dJNI.cpp
-    src/main/native/cpp/jni/StateSpaceUtilJNI.cpp
     src/main/native/cpp/jni/TrajectoryUtilJNI.cpp
 )
 

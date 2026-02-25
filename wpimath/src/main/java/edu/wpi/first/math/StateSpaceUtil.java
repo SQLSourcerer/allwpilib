@@ -5,11 +5,16 @@
 package edu.wpi.first.math;
 
 import edu.wpi.first.math.geometry.Pose2d;
-import edu.wpi.first.math.jni.StateSpaceUtilJNI;
 import edu.wpi.first.math.numbers.N1;
 import edu.wpi.first.math.numbers.N3;
 import edu.wpi.first.math.numbers.N4;
 import java.util.Random;
+import org.ejml.data.Complex_F64;
+import org.ejml.data.DMatrixRMaj;
+import org.ejml.dense.row.CommonOps_DDRM;
+import org.ejml.dense.row.factory.DecompositionFactory_DDRM;
+import org.ejml.interfaces.decomposition.EigenDecomposition_F64;
+import org.ejml.interfaces.decomposition.SingularValueDecomposition_F64;
 import org.ejml.simple.SimpleMatrix;
 
 /** State-space utilities. */
@@ -103,8 +108,7 @@ public final class StateSpaceUtil {
    */
   public static <States extends Num, Inputs extends Num> boolean isStabilizable(
       Matrix<States, States> A, Matrix<States, Inputs> B) {
-    return StateSpaceUtilJNI.isStabilizable(
-        A.getNumRows(), B.getNumCols(), A.getData(), B.getData());
+    return isStabilizable(A.getStorage().getDDRM(), B.getStorage().getDDRM());
   }
 
   /**
@@ -122,8 +126,105 @@ public final class StateSpaceUtil {
    */
   public static <States extends Num, Outputs extends Num> boolean isDetectable(
       Matrix<States, States> A, Matrix<Outputs, States> C) {
-    return StateSpaceUtilJNI.isStabilizable(
-        A.getNumRows(), C.getNumRows(), A.transpose().getData(), C.transpose().getData());
+    DMatrixRMaj AT = new DMatrixRMaj(A.getNumCols(), A.getNumRows());
+    CommonOps_DDRM.transpose(A.getStorage().getDDRM(), AT);
+    DMatrixRMaj CT = new DMatrixRMaj(C.getNumCols(), C.getNumRows());
+    CommonOps_DDRM.transpose(C.getStorage().getDDRM(), CT);
+    return isStabilizable(AT, CT);
+  }
+
+  /**
+   * Returns true if (A, B) is a stabilizable pair.
+   *
+   * <p>Uses a real-arithmetic PBH rank test. For each eigenvalue λ = a+bi of A with |λ|² ≥ 1,
+   * builds the real block matrix and checks that its rank equals 2n.
+   */
+  static boolean isStabilizable(DMatrixRMaj A, DMatrixRMaj B) {
+    int n = A.numRows;
+    int m = B.numCols;
+
+    EigenDecomposition_F64<DMatrixRMaj> eig = DecompositionFactory_DDRM.eig(n, false);
+    eig.decompose(A.copy());
+
+    DMatrixRMaj BT = new DMatrixRMaj(m, n);
+    CommonOps_DDRM.transpose(B, BT);
+
+    for (int i = 0; i < n; i++) {
+      Complex_F64 ev = eig.getEigenvalue(i);
+      double a = ev.real;
+      double b = ev.imaginary;
+
+      if (a * a + b * b < 1.0) {
+        continue;
+      }
+
+      DMatrixRMaj aIA = CommonOps_DDRM.identity(n);
+      CommonOps_DDRM.scale(a, aIA);
+      CommonOps_DDRM.subtractEquals(aIA, A);
+
+      DMatrixRMaj aIAT = new DMatrixRMaj(n, n);
+      CommonOps_DDRM.transpose(aIA, aIAT);
+
+      int rows = 2 * n + 2 * m;
+      int cols = 2 * n;
+      DMatrixRMaj M = new DMatrixRMaj(rows, cols);
+
+      for (int r = 0; r < n; r++) {
+        for (int c = 0; c < n; c++) {
+          M.set(r, c, aIAT.get(r, c));
+        }
+        M.set(r, n + r, b);
+      }
+
+      for (int r = 0; r < n; r++) {
+        M.set(n + r, r, b);
+        for (int c = 0; c < n; c++) {
+          M.set(n + r, n + c, -aIAT.get(r, c));
+        }
+      }
+
+      for (int r = 0; r < m; r++) {
+        for (int c = 0; c < n; c++) {
+          M.set(2 * n + r, c, BT.get(r, c));
+        }
+      }
+
+      for (int r = 0; r < m; r++) {
+        for (int c = 0; c < n; c++) {
+          M.set(2 * n + m + r, n + c, BT.get(r, c));
+        }
+      }
+
+      if (computeRank(M) < 2 * n) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private static int computeRank(DMatrixRMaj M) {
+    SingularValueDecomposition_F64<DMatrixRMaj> svd =
+        DecompositionFactory_DDRM.svd(M.numRows, M.numCols, false, false, false);
+    svd.decompose(M.copy());
+
+    int numSV = svd.numberOfSingularValues();
+    double[] sv = svd.getSingularValues();
+
+    double maxSV = 0.0;
+    for (int i = 0; i < numSV; i++) {
+      if (sv[i] > maxSV) {
+        maxSV = sv[i];
+      }
+    }
+
+    double tol = 1e-10 * maxSV;
+    int rank = 0;
+    for (int i = 0; i < numSV; i++) {
+      if (sv[i] > tol) {
+        rank++;
+      }
+    }
+    return rank;
   }
 
   /**
