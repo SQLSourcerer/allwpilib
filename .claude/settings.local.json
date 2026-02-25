@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "WebFetch(domain:ejml.org)"
+      "WebFetch(domain:ejml.org)",
+      "Bash(xargs basename)"
     ]
   }
 }

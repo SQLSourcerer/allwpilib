@@ -4,7 +4,6 @@
 
 package edu.wpi.first.math;
 
-import edu.wpi.first.math.jni.EigenJNI;
 import edu.wpi.first.math.numbers.N1;
 import edu.wpi.first.math.proto.MatrixProto;
 import edu.wpi.first.math.struct.MatrixStruct;
@@ -16,12 +15,16 @@ import edu.wpi.first.util.struct.StructSerializable;
 import java.util.Objects;
 
 import org.ejml.MatrixDimensionException;
+import org.ejml.data.Complex_F64;
 import org.ejml.data.DMatrixRMaj;
 import org.ejml.dense.row.CommonOps_DDRM;
 import org.ejml.dense.row.MatrixFeatures_DDRM;
 import org.ejml.dense.row.NormOps_DDRM;
 import org.ejml.dense.row.factory.DecompositionFactory_DDRM;
+import org.ejml.dense.row.factory.LinearSolverFactory_DDRM;
 import org.ejml.interfaces.decomposition.CholeskyDecomposition_F64;
+import org.ejml.interfaces.decomposition.EigenDecomposition_F64;
+import org.ejml.interfaces.linsol.LinearSolverDense;
 import org.ejml.simple.SimpleMatrix;
 
 /**
@@ -371,21 +374,22 @@ public class Matrix<R extends Num, C extends Num>
      */
     public final <R2 extends Num, C2 extends Num> Matrix<C, C2> solveFullPivHouseholderQr(
             Matrix<R2, C2> other) {
-        Matrix<C, C2> solution = new Matrix<>(new SimpleMatrix(this.getNumCols(), other.getNumCols()));
-        EigenJNI.solveFullPivHouseholderQr(
-                this.getData(),
-                this.getNumRows(),
-                this.getNumCols(),
-                other.getData(),
-                other.getNumRows(),
-                other.getNumCols(),
-                solution.getData());
-        return solution;
+        DMatrixRMaj A = this.m_storage.getDDRM().copy();
+        DMatrixRMaj B = other.m_storage.getDDRM().copy();
+        DMatrixRMaj X = new DMatrixRMaj(A.numCols, B.numCols);
+        LinearSolverDense<DMatrixRMaj> solver = LinearSolverFactory_DDRM.leastSquaresQrPivot(true, false);
+        if (!solver.setA(A)) {
+            throw new RuntimeException("solveFullPivHouseholderQr: failed to decompose A");
+        }
+        solver.solve(B, X);
+        return new Matrix<>(SimpleMatrix.wrap(X));
     }
 
     /**
-     * Computes the matrix exponential using Eigen's solver. This method only works for square
-     * matrices, and will otherwise throw an {@link MatrixDimensionException}.
+     * Computes the matrix exponential. This method only works for square matrices, and will
+     * otherwise throw an {@link MatrixDimensionException}.
+     *
+     * <p>Uses the degree-13 Padé approximant with scaling and squaring (Higham 2005).
      *
      * @return The exponential of A.
      */
@@ -398,20 +402,102 @@ public class Matrix<R extends Num, C extends Num>
                             + " x "
                             + this.getNumCols());
         }
-        Matrix<R, C> toReturn = new Matrix<>(new SimpleMatrix(this.getNumRows(), this.getNumCols()));
-        EigenJNI.exp(
-                this.m_storage.getDDRM().getData(),
-                this.getNumRows(),
-                toReturn.m_storage.getDDRM().getData());
-        return toReturn;
+        int n = this.getNumRows();
+        DMatrixRMaj result = matExp(this.m_storage.getDDRM().copy(), n);
+        return new Matrix<>(SimpleMatrix.wrap(result));
     }
 
     /**
-     * Computes the matrix power using Eigen's solver. This method only works for square matrices, and
-     * will otherwise throw an {@link MatrixDimensionException}.
+     * Computes the matrix exponential using a degree-13 Padé approximant with scaling and
+     * squaring (Higham 2005).
+     *
+     * @param A Input matrix (modified in place during computation; pass a copy).
+     * @param n Dimension of the square matrix.
+     * @return exp(A).
+     */
+    private static DMatrixRMaj matExp(DMatrixRMaj A, int n) {
+        // Degree-13 Padé coefficients (Higham, "The Scaling and Squaring Method
+        // for the Matrix Exponential Revisited", SIAM J. Matrix Anal. Appl. 2005).
+        final double[] b = {
+            64764752532480000.0, 32382376266240000.0, 7771770303897600.0,
+            1187353796428800.0,  129060195264000.0,   10559470521600.0,
+            670442572800.0,      33522128640.0,        1323241920.0,
+            40840800.0,          960960.0,             16380.0,
+            182.0,               1.0
+        };
+        final double theta13 = 5.371920351148152;
+
+        // Determine scaling: scale A by 2^{-s} so ||A/2^s||_1 <= theta13.
+        double normA = NormOps_DDRM.inducedP1(A);
+        int s = 0;
+        if (normA > theta13) {
+            s = (int) Math.ceil(Math.log(normA / theta13) / Math.log(2.0));
+            CommonOps_DDRM.scale(Math.pow(2.0, -s), A);
+        }
+
+        // Compute matrix powers: A2 = A^2, A4 = A^4, A6 = A^6.
+        DMatrixRMaj I   = CommonOps_DDRM.identity(n);
+        DMatrixRMaj A2  = new DMatrixRMaj(n, n);
+        DMatrixRMaj A4  = new DMatrixRMaj(n, n);
+        DMatrixRMaj A6  = new DMatrixRMaj(n, n);
+        DMatrixRMaj tmp = new DMatrixRMaj(n, n);
+        CommonOps_DDRM.mult(A, A, A2);
+        CommonOps_DDRM.mult(A2, A2, A4);
+        CommonOps_DDRM.mult(A2, A4, A6);
+
+        // U = A * (A6*(b[13]*A6 + b[11]*A4 + b[9]*A2) + b[7]*A6 + b[5]*A4 + b[3]*A2 + b[1]*I)
+        DMatrixRMaj inner = new DMatrixRMaj(n, n);
+        CommonOps_DDRM.scale(b[13], A6, inner);
+        CommonOps_DDRM.addEquals(inner, b[11], A4);
+        CommonOps_DDRM.addEquals(inner, b[9],  A2);
+        CommonOps_DDRM.mult(A6, inner, tmp);
+        CommonOps_DDRM.addEquals(tmp, b[7], A6);
+        CommonOps_DDRM.addEquals(tmp, b[5], A4);
+        CommonOps_DDRM.addEquals(tmp, b[3], A2);
+        CommonOps_DDRM.addEquals(tmp, b[1], I);
+        DMatrixRMaj U = new DMatrixRMaj(n, n);
+        CommonOps_DDRM.mult(A, tmp, U);
+
+        // V = A6*(b[12]*A6 + b[10]*A4 + b[8]*A2) + b[6]*A6 + b[4]*A4 + b[2]*A2 + b[0]*I
+        DMatrixRMaj Vtmp = new DMatrixRMaj(n, n);
+        CommonOps_DDRM.scale(b[12], A6, Vtmp);
+        CommonOps_DDRM.addEquals(Vtmp, b[10], A4);
+        CommonOps_DDRM.addEquals(Vtmp, b[8],  A2);
+        DMatrixRMaj V = new DMatrixRMaj(n, n);
+        CommonOps_DDRM.mult(A6, Vtmp, V);
+        CommonOps_DDRM.addEquals(V, b[6], A6);
+        CommonOps_DDRM.addEquals(V, b[4], A4);
+        CommonOps_DDRM.addEquals(V, b[2], A2);
+        CommonOps_DDRM.addEquals(V, b[0], I);
+
+        // exp(A/2^s) ≈ (V - U)^{-1} * (V + U).
+        DMatrixRMaj P = new DMatrixRMaj(n, n); // V + U (numerator)
+        DMatrixRMaj Q = new DMatrixRMaj(n, n); // V - U (denominator)
+        CommonOps_DDRM.add(V, U, P);
+        CommonOps_DDRM.subtract(V, U, Q);
+        DMatrixRMaj R = new DMatrixRMaj(n, n);
+        CommonOps_DDRM.solve(Q, P, R);
+
+        // Squaring phase: exp(A) = exp(A/2^s)^{2^s}.
+        DMatrixRMaj R2 = new DMatrixRMaj(n, n);
+        for (int i = 0; i < s; i++) {
+            CommonOps_DDRM.mult(R, R, R2);
+            DMatrixRMaj swap = R;
+            R = R2;
+            R2 = swap;
+        }
+        return R;
+    }
+
+    /**
+     * Computes the matrix power. This method only works for square matrices, and will otherwise throw
+     * an {@link MatrixDimensionException}.
+     *
+     * <p>Uses eigendecomposition: A^p = V * D^p * V^{-1}. For complex conjugate eigenvalue pairs the
+     * contribution is computed using real arithmetic to keep the result real.
      *
      * @param exponent The exponent.
-     * @return The exponential of A.
+     * @return A raised to the given power.
      */
     public final Matrix<R, C> pow(double exponent) {
         if (this.getNumRows() != this.getNumCols()) {
@@ -422,13 +508,91 @@ public class Matrix<R extends Num, C extends Num>
                             + " x "
                             + this.getNumCols());
         }
-        Matrix<R, C> toReturn = new Matrix<>(new SimpleMatrix(this.getNumRows(), this.getNumCols()));
-        EigenJNI.pow(
-                this.m_storage.getDDRM().getData(),
-                this.getNumRows(),
-                exponent,
-                toReturn.m_storage.getDDRM().getData());
-        return toReturn;
+        int n = this.getNumRows();
+
+        // Eigendecompose A.  EJML stores complex conjugate pairs consecutively:
+        //   eigenvalue[k]   = a + bi  (b > 0)
+        //   eigenvalue[k+1] = a - bi
+        //   getEigenVector(k)   = Re(v),  getEigenVector(k+1) = Im(v)
+        EigenDecomposition_F64<DMatrixRMaj> eig = DecompositionFactory_DDRM.eig(n, true);
+        eig.decompose(this.m_storage.getDDRM().copy());
+
+        // Build the real eigenvector matrix V (columns = Re/Im parts as above).
+        DMatrixRMaj V = new DMatrixRMaj(n, n);
+        for (int i = 0; i < n; i++) {
+            DMatrixRMaj vec = eig.getEigenVector(i);
+            if (vec != null) {
+                for (int row = 0; row < n; row++) {
+                    V.set(row, i, vec.get(row, 0));
+                }
+            }
+        }
+
+        // V^{-1}: rows are the left-eigenvector duals.
+        DMatrixRMaj Vinv = new DMatrixRMaj(n, n);
+        CommonOps_DDRM.invert(V, Vinv);
+
+        // Accumulate A^p = sum_k  lambda_k^p * outer(V[:,k], Vinv[k,:]).
+        DMatrixRMaj result = new DMatrixRMaj(n, n);
+        for (int i = 0; i < n; ) {
+            Complex_F64 ev = eig.getEigenvalue(i);
+
+            if (Math.abs(ev.imaginary) < 1e-10) {
+                // ── Real eigenvalue ──────────────────────────────────────────
+                double r  = Math.abs(ev.real);
+                double rp = (r == 0.0) ? 0.0 : Math.pow(r, exponent);
+                // For a negative real eigenvalue λ = -|λ|:
+                //   λ^p = |λ|^p * e^{i·p·π};  real part = |λ|^p * cos(p·π).
+                double lambda_p = (ev.real >= 0.0)
+                        ? rp
+                        : rp * Math.cos(exponent * Math.PI);
+
+                // Contribution: lambda_p * outer(V[:,i], Vinv[i,:])
+                for (int row = 0; row < n; row++) {
+                    double vri = V.get(row, i);
+                    for (int col = 0; col < n; col++) {
+                        result.set(row, col, result.get(row, col)
+                                + lambda_p * vri * Vinv.get(i, col));
+                    }
+                }
+                i++;
+
+            } else if (ev.imaginary > 0.0) {
+                // ── Complex conjugate pair at (i, i+1) ───────────────────────
+                // v_r = V[:,i],  v_i = V[:,i+1]
+                // u_r = Vinv[i,:],  u_i = Vinv[i+1,:]
+                // lambda^p = r^p * (cos(p*theta) + i*sin(p*theta))
+                // Contribution (real part after conjugate summation):
+                //   2 * [ (c*v_r - s*v_i)*u_r^T  +  (s*v_r + c*v_i)*u_i^T ]
+                // where c = r^p*cos(p*theta), s = r^p*sin(p*theta).
+                double r     = Math.hypot(ev.real, ev.imaginary);
+                double theta = Math.atan2(ev.imaginary, ev.real);
+                double rp    = (r == 0.0) ? 0.0 : Math.pow(r, exponent);
+                double c     = rp * Math.cos(exponent * theta);
+                double s     = rp * Math.sin(exponent * theta);
+
+                for (int row = 0; row < n; row++) {
+                    double vr = V.get(row, i);
+                    double vi = V.get(row, i + 1);
+                    double p1 = c * vr - s * vi;
+                    double p2 = s * vr + c * vi;
+                    for (int col = 0; col < n; col++) {
+                        double ur = Vinv.get(i,     col);
+                        double ui = Vinv.get(i + 1, col);
+                        result.set(row, col, result.get(row, col)
+                                + 2.0 * (p1 * ur + p2 * ui));
+                    }
+                }
+                i += 2; // skip the conjugate (negative imaginary) entry
+
+            } else {
+                // Negative-imaginary eigenvalue: already consumed as part of its
+                // conjugate pair when we processed the positive-imaginary partner.
+                i++;
+            }
+        }
+
+        return new Matrix<>(SimpleMatrix.wrap(result));
     }
 
     /**

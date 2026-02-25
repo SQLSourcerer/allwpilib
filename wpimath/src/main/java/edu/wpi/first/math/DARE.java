@@ -4,7 +4,14 @@
 
 package edu.wpi.first.math;
 
-import edu.wpi.first.math.jni.DAREJNI;
+import org.ejml.data.Complex_F64;
+import org.ejml.data.DMatrixRMaj;
+import org.ejml.dense.row.CommonOps_DDRM;
+import org.ejml.dense.row.NormOps_DDRM;
+import org.ejml.dense.row.factory.DecompositionFactory_DDRM;
+import org.ejml.interfaces.decomposition.CholeskyDecomposition_F64;
+import org.ejml.interfaces.decomposition.EigenDecomposition_F64;
+import org.ejml.interfaces.decomposition.SingularValueDecomposition_F64;
 import org.ejml.simple.SimpleMatrix;
 
 /** DARE solver utility functions. */
@@ -43,16 +50,13 @@ public final class DARE {
       Matrix<States, Inputs> B,
       Matrix<States, States> Q,
       Matrix<Inputs, Inputs> R) {
-    var S = new Matrix<States, States>(new SimpleMatrix(A.getNumRows(), A.getNumCols()));
-    DAREJNI.dareNoPrecondABQR(
-        A.getStorage().getDDRM().getData(),
-        B.getStorage().getDDRM().getData(),
-        Q.getStorage().getDDRM().getData(),
-        R.getStorage().getDDRM().getData(),
-        A.getNumCols(),
-        B.getNumCols(),
-        S.getStorage().getDDRM().getData());
-    return S;
+    DMatrixRMaj result =
+        sdaCore(
+            A.getStorage().getDDRM(),
+            B.getStorage().getDDRM(),
+            Q.getStorage().getDDRM(),
+            R.getStorage().getDDRM());
+    return new Matrix<>(new SimpleMatrix(result));
   }
 
   /**
@@ -121,17 +125,19 @@ public final class DARE {
       Matrix<States, States> Q,
       Matrix<Inputs, Inputs> R,
       Matrix<States, Inputs> N) {
-    var S = new Matrix<States, States>(new SimpleMatrix(A.getNumRows(), A.getNumCols()));
-    DAREJNI.dareNoPrecondABQRN(
-        A.getStorage().getDDRM().getData(),
-        B.getStorage().getDDRM().getData(),
-        Q.getStorage().getDDRM().getData(),
-        R.getStorage().getDDRM().getData(),
-        N.getStorage().getDDRM().getData(),
-        A.getNumCols(),
-        B.getNumCols(),
-        S.getStorage().getDDRM().getData());
-    return S;
+    DMatrixRMaj Amat = A.getStorage().getDDRM();
+    DMatrixRMaj Bmat = B.getStorage().getDDRM();
+    DMatrixRMaj Qmat = Q.getStorage().getDDRM();
+    DMatrixRMaj Rmat = R.getStorage().getDDRM();
+    DMatrixRMaj Nmat = N.getStorage().getDDRM();
+
+    // A₂ = A − BR⁻¹Nᵀ, Q₂ = Q − NR⁻¹Nᵀ
+    DMatrixRMaj[] transformed = applyNTransform(Amat, Bmat, Qmat, Rmat, Nmat);
+    DMatrixRMaj A2 = transformed[0];
+    DMatrixRMaj Q2 = transformed[1];
+
+    DMatrixRMaj result = sdaCore(A2, Bmat, Q2, Rmat);
+    return new Matrix<>(new SimpleMatrix(result));
   }
 
   /**
@@ -156,16 +162,14 @@ public final class DARE {
       Matrix<States, Inputs> B,
       Matrix<States, States> Q,
       Matrix<Inputs, Inputs> R) {
-    var S = new Matrix<States, States>(new SimpleMatrix(A.getNumRows(), A.getNumCols()));
-    DAREJNI.dareABQR(
-        A.getStorage().getDDRM().getData(),
-        B.getStorage().getDDRM().getData(),
-        Q.getStorage().getDDRM().getData(),
-        R.getStorage().getDDRM().getData(),
-        A.getNumCols(),
-        B.getNumCols(),
-        S.getStorage().getDDRM().getData());
-    return S;
+    DMatrixRMaj Amat = A.getStorage().getDDRM();
+    DMatrixRMaj Bmat = B.getStorage().getDDRM();
+    DMatrixRMaj Qmat = Q.getStorage().getDDRM();
+    DMatrixRMaj Rmat = R.getStorage().getDDRM();
+
+    checkPreconditions(Amat, Bmat, Qmat, Rmat);
+    DMatrixRMaj result = sdaCore(Amat, Bmat, Qmat, Rmat);
+    return new Matrix<>(new SimpleMatrix(result));
   }
 
   /**
@@ -226,16 +230,344 @@ public final class DARE {
       Matrix<States, States> Q,
       Matrix<Inputs, Inputs> R,
       Matrix<States, Inputs> N) {
-    var S = new Matrix<States, States>(new SimpleMatrix(A.getNumRows(), A.getNumCols()));
-    DAREJNI.dareABQRN(
-        A.getStorage().getDDRM().getData(),
-        B.getStorage().getDDRM().getData(),
-        Q.getStorage().getDDRM().getData(),
-        R.getStorage().getDDRM().getData(),
-        N.getStorage().getDDRM().getData(),
-        A.getNumCols(),
-        B.getNumCols(),
-        S.getStorage().getDDRM().getData());
-    return S;
+    DMatrixRMaj Amat = A.getStorage().getDDRM();
+    DMatrixRMaj Bmat = B.getStorage().getDDRM();
+    DMatrixRMaj Qmat = Q.getStorage().getDDRM();
+    DMatrixRMaj Rmat = R.getStorage().getDDRM();
+    DMatrixRMaj Nmat = N.getStorage().getDDRM();
+
+    // Check R symmetric before attempting to compute R⁻¹
+    checkRSymmetric(Rmat);
+    // Check R positive definite (R⁻¹ is needed for the transform)
+    checkRPD(Rmat);
+
+    // A₂ = A − BR⁻¹Nᵀ, Q₂ = Q − NR⁻¹Nᵀ
+    DMatrixRMaj[] transformed = applyNTransform(Amat, Bmat, Qmat, Rmat, Nmat);
+    DMatrixRMaj A2 = transformed[0];
+    DMatrixRMaj Q2 = transformed[1];
+
+    // Check remaining preconditions on the transformed matrices
+    checkQSymmetric(Q2);
+    checkQPSD(Q2);
+    checkStabilizability(A2, Bmat);
+    checkDetectability(A2, Q2);
+
+    DMatrixRMaj result = sdaCore(A2, Bmat, Q2, Rmat);
+    return new Matrix<>(new SimpleMatrix(result));
+  }
+
+  /**
+   * Computes A₂ = A − BR⁻¹Nᵀ and Q₂ = Q − NR⁻¹Nᵀ.
+   *
+   * @return Array of {A₂, Q₂}.
+   */
+  private static DMatrixRMaj[] applyNTransform(
+      DMatrixRMaj A, DMatrixRMaj B, DMatrixRMaj Q, DMatrixRMaj R, DMatrixRMaj N) {
+    int n = A.numRows;
+    int m = B.numCols;
+
+    // Solve R * X = Nᵀ → X = R⁻¹Nᵀ
+    DMatrixRMaj NT = new DMatrixRMaj(m, n);
+    CommonOps_DDRM.transpose(N, NT);
+    DMatrixRMaj RinvNT = new DMatrixRMaj(m, n);
+    CommonOps_DDRM.solve(R.copy(), NT, RinvNT);
+
+    // A₂ = A − B(R⁻¹Nᵀ)
+    DMatrixRMaj BRinvNT = new DMatrixRMaj(n, n);
+    CommonOps_DDRM.mult(B, RinvNT, BRinvNT);
+    DMatrixRMaj A2 = new DMatrixRMaj(n, n);
+    CommonOps_DDRM.subtract(A, BRinvNT, A2);
+
+    // Q₂ = Q − N(R⁻¹Nᵀ)
+    DMatrixRMaj NRinvNT = new DMatrixRMaj(n, n);
+    CommonOps_DDRM.mult(N, RinvNT, NRinvNT);
+    DMatrixRMaj Q2 = new DMatrixRMaj(n, n);
+    CommonOps_DDRM.subtract(Q, NRinvNT, Q2);
+
+    return new DMatrixRMaj[] {A2, Q2};
+  }
+
+  /**
+   * Checks all preconditions for dare(A, B, Q, R): R symmetric, R PD, Q symmetric, Q PSD,
+   * stabilizability, and detectability.
+   */
+  private static void checkPreconditions(
+      DMatrixRMaj A, DMatrixRMaj B, DMatrixRMaj Q, DMatrixRMaj R) {
+    checkRSymmetric(R);
+    checkRPD(R);
+    checkQSymmetric(Q);
+    checkQPSD(Q);
+    checkStabilizability(A, B);
+    checkDetectability(A, Q);
+  }
+
+  private static void checkRSymmetric(DMatrixRMaj R) {
+    DMatrixRMaj RT = new DMatrixRMaj(R.numCols, R.numRows);
+    CommonOps_DDRM.transpose(R, RT);
+    DMatrixRMaj diff = new DMatrixRMaj(R.numRows, R.numCols);
+    CommonOps_DDRM.subtract(R, RT, diff);
+    if (NormOps_DDRM.normF(diff) > 1e-10) {
+      throw new IllegalArgumentException("R is not symmetric.");
+    }
+  }
+
+  private static void checkRPD(DMatrixRMaj R) {
+    CholeskyDecomposition_F64<DMatrixRMaj> chol =
+        DecompositionFactory_DDRM.chol(R.numRows, true);
+    if (!chol.decompose(R.copy())) {
+      throw new IllegalArgumentException("R is not positive definite.");
+    }
+  }
+
+  private static void checkQSymmetric(DMatrixRMaj Q) {
+    DMatrixRMaj QT = new DMatrixRMaj(Q.numCols, Q.numRows);
+    CommonOps_DDRM.transpose(Q, QT);
+    DMatrixRMaj diff = new DMatrixRMaj(Q.numRows, Q.numCols);
+    CommonOps_DDRM.subtract(Q, QT, diff);
+    if (NormOps_DDRM.normF(diff) > 1e-10) {
+      throw new IllegalArgumentException("Q is not symmetric.");
+    }
+  }
+
+  private static void checkQPSD(DMatrixRMaj Q) {
+    int n = Q.numRows;
+    EigenDecomposition_F64<DMatrixRMaj> eig = DecompositionFactory_DDRM.eig(n, false, true);
+    eig.decompose(Q.copy());
+    for (int i = 0; i < n; i++) {
+      if (eig.getEigenvalue(i).real < 0.0) {
+        throw new IllegalArgumentException("Q is not positive semidefinite.");
+      }
+    }
+  }
+
+  private static void checkStabilizability(DMatrixRMaj A, DMatrixRMaj B) {
+    if (!isStabilizable(A, B)) {
+      throw new IllegalArgumentException("The (A, B) pair is not stabilizable.");
+    }
+  }
+
+  /**
+   * Checks detectability of (A, C) where Q = CᵀC, by extracting C via symmetric eigendecomposition
+   * Q = VDVᵀ → C = √D · Vᵀ, then checking isStabilizable(Aᵀ, Cᵀ).
+   */
+  private static void checkDetectability(DMatrixRMaj A, DMatrixRMaj Q) {
+    int n = Q.numRows;
+
+    // Q = VDVᵀ, C = √D · Vᵀ  (so CᵀC = V√D·√DVᵀ = VDVᵀ = Q)
+    EigenDecomposition_F64<DMatrixRMaj> eig = DecompositionFactory_DDRM.eig(n, true, true);
+    eig.decompose(Q.copy());
+
+    // Build C: row i = √λᵢ · vᵢᵀ
+    DMatrixRMaj C = new DMatrixRMaj(n, n);
+    for (int i = 0; i < n; i++) {
+      double sqrtEv = Math.sqrt(Math.max(0.0, eig.getEigenvalue(i).real));
+      DMatrixRMaj v = eig.getEigenVector(i);
+      for (int j = 0; j < n; j++) {
+        C.set(i, j, sqrtEv * v.get(j, 0));
+      }
+    }
+
+    // isDetectable(A, C) = isStabilizable(Aᵀ, Cᵀ)
+    DMatrixRMaj AT = new DMatrixRMaj(n, n);
+    CommonOps_DDRM.transpose(A, AT);
+    DMatrixRMaj CT = new DMatrixRMaj(n, n);
+    CommonOps_DDRM.transpose(C, CT);
+
+    if (!isStabilizable(AT, CT)) {
+      throw new IllegalArgumentException(
+          "The (A, C) pair where Q = CᵀC is not detectable.");
+    }
+  }
+
+  /**
+   * Returns true if (A, B) is a stabilizable pair.
+   *
+   * <p>Uses a real-arithmetic PBH rank test. For each eigenvalue λ = a+bi of A with |λ|² ≥ 1,
+   * builds the real block matrix:
+   *
+   * <pre>
+   * M = [ (aI−A)ᵀ   b·I       ]  ← n rows
+   *     [ b·I      −(aI−A)ᵀ   ]  ← n rows
+   *     [ Bᵀ        0          ]  ← m rows
+   *     [ 0         Bᵀ         ]  ← m rows
+   * </pre>
+   *
+   * and checks rank(M) = 2n. If any unstable eigenvalue yields rank(M) < 2n, the pair is not
+   * stabilizable.
+   */
+  private static boolean isStabilizable(DMatrixRMaj A, DMatrixRMaj B) {
+    int n = A.numRows;
+    int m = B.numCols;
+
+    // Eigenvalues of A (non-symmetric, no vectors needed)
+    EigenDecomposition_F64<DMatrixRMaj> eig = DecompositionFactory_DDRM.eig(n, false);
+    eig.decompose(A.copy());
+
+    // Precompute Bᵀ (m × n)
+    DMatrixRMaj BT = new DMatrixRMaj(m, n);
+    CommonOps_DDRM.transpose(B, BT);
+
+    for (int i = 0; i < n; i++) {
+      Complex_F64 ev = eig.getEigenvalue(i);
+      double a = ev.real;
+      double b = ev.imaginary;
+
+      // Skip stable eigenvalues (|λ|² < 1)
+      if (a * a + b * b < 1.0) {
+        continue;
+      }
+
+      // aI − A
+      DMatrixRMaj aIA = CommonOps_DDRM.identity(n);
+      CommonOps_DDRM.scale(a, aIA);
+      CommonOps_DDRM.subtractEquals(aIA, A);
+
+      // (aI−A)ᵀ
+      DMatrixRMaj aIAT = new DMatrixRMaj(n, n);
+      CommonOps_DDRM.transpose(aIA, aIAT);
+
+      // Build M of size (2n+2m) × 2n
+      int rows = 2 * n + 2 * m;
+      int cols = 2 * n;
+      DMatrixRMaj M = new DMatrixRMaj(rows, cols);
+
+      // Row block 0 (rows 0..n-1): [ (aI−A)ᵀ  |  b·I ]
+      for (int r = 0; r < n; r++) {
+        for (int c = 0; c < n; c++) {
+          M.set(r, c, aIAT.get(r, c));
+        }
+        M.set(r, n + r, b);
+      }
+
+      // Row block 1 (rows n..2n-1): [ b·I  |  −(aI−A)ᵀ ]
+      for (int r = 0; r < n; r++) {
+        M.set(n + r, r, b);
+        for (int c = 0; c < n; c++) {
+          M.set(n + r, n + c, -aIAT.get(r, c));
+        }
+      }
+
+      // Row block 2 (rows 2n..2n+m-1): [ Bᵀ  |  0 ]
+      for (int r = 0; r < m; r++) {
+        for (int c = 0; c < n; c++) {
+          M.set(2 * n + r, c, BT.get(r, c));
+        }
+      }
+
+      // Row block 3 (rows 2n+m..2n+2m-1): [ 0  |  Bᵀ ]
+      for (int r = 0; r < m; r++) {
+        for (int c = 0; c < n; c++) {
+          M.set(2 * n + m + r, n + c, BT.get(r, c));
+        }
+      }
+
+      if (computeRank(M) < 2 * n) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Computes the rank of a matrix via SVD. Uses a relative threshold of 1e-10 × max singular
+   * value.
+   */
+  private static int computeRank(DMatrixRMaj M) {
+    SingularValueDecomposition_F64<DMatrixRMaj> svd =
+        DecompositionFactory_DDRM.svd(M.numRows, M.numCols, false, false, false);
+    svd.decompose(M.copy());
+
+    int numSV = svd.numberOfSingularValues();
+    double[] sv = svd.getSingularValues();
+
+    double maxSV = 0.0;
+    for (int i = 0; i < numSV; i++) {
+      if (sv[i] > maxSV) {
+        maxSV = sv[i];
+      }
+    }
+
+    double tol = 1e-10 * maxSV;
+    int rank = 0;
+    for (int i = 0; i < numSV; i++) {
+      if (sv[i] > tol) {
+        rank++;
+      }
+    }
+    return rank;
+  }
+
+  /**
+   * Implements the Structured Doubling Algorithm (SDA) for the DARE.
+   *
+   * <p>Reference: E. K.-W. Chu, H.-Y. Fan, W.-W. Lin & C.-S. Wang, "Structure-Preserving
+   * Algorithms for Periodic Discrete-Time Algebraic Riccati Equations", International Journal of
+   * Control, 77:8, 767-788, 2004. DOI: 10.1080/00207170410001714988
+   *
+   * @param A System matrix (n × n).
+   * @param B Input matrix (n × m).
+   * @param Q State cost matrix (n × n), symmetric PSD.
+   * @param R Input cost matrix (m × m), symmetric PD.
+   * @return Solution X to the DARE (n × n).
+   */
+  private static DMatrixRMaj sdaCore(
+      DMatrixRMaj A, DMatrixRMaj B, DMatrixRMaj Q, DMatrixRMaj R) {
+    int n = A.numRows;
+
+    // G₀ = B R⁻¹ Bᵀ
+    // Solve R * X = Bᵀ → X = R⁻¹Bᵀ
+    DMatrixRMaj BT = new DMatrixRMaj(B.numCols, B.numRows);
+    CommonOps_DDRM.transpose(B, BT);
+    DMatrixRMaj RinvBT = new DMatrixRMaj(R.numRows, BT.numCols);
+    CommonOps_DDRM.solve(R.copy(), BT, RinvBT);
+    DMatrixRMaj G_k = new DMatrixRMaj(n, n);
+    CommonOps_DDRM.mult(B, RinvBT, G_k);
+
+    DMatrixRMaj A_k = A.copy();
+    DMatrixRMaj H_k = new DMatrixRMaj(n, n);
+    DMatrixRMaj H_k1 = Q.copy();
+
+    DMatrixRMaj W = new DMatrixRMaj(n, n);
+    DMatrixRMaj V1 = new DMatrixRMaj(n, n);
+    DMatrixRMaj V2 = new DMatrixRMaj(n, n);
+    DMatrixRMaj tmp1 = new DMatrixRMaj(n, n);
+    DMatrixRMaj tmp2 = new DMatrixRMaj(n, n);
+    DMatrixRMaj diffH = new DMatrixRMaj(n, n);
+
+    do {
+      // H_k ← H_k1  (save current value for convergence check)
+      H_k.setTo(H_k1);
+
+      // W = I + GₖHₖ
+      CommonOps_DDRM.mult(G_k, H_k, W);
+      CommonOps_DDRM.addEquals(W, CommonOps_DDRM.identity(n));
+
+      // Solve WV₁ = Aₖ for V₁
+      CommonOps_DDRM.solve(W.copy(), A_k, V1);
+
+      // Solve WV₂ = Gₖ for V₂ (W and Gₖ are symmetric)
+      CommonOps_DDRM.solve(W.copy(), G_k, V2);
+
+      // Gₖ₊₁ = Gₖ + Aₖ V₂ Aₖᵀ
+      CommonOps_DDRM.mult(A_k, V2, tmp1);         // tmp1 = Aₖ V₂
+      CommonOps_DDRM.multTransB(tmp1, A_k, tmp2); // tmp2 = (Aₖ V₂) Aₖᵀ
+      CommonOps_DDRM.addEquals(G_k, tmp2);
+
+      // Hₖ₊₁ = Hₖ + V₁ᵀ Hₖ Aₖ
+      CommonOps_DDRM.multTransA(V1, H_k, tmp1); // tmp1 = V₁ᵀ Hₖ
+      CommonOps_DDRM.mult(tmp1, A_k, tmp2);      // tmp2 = V₁ᵀ Hₖ Aₖ
+      // H_k1 ← H_k, then add increment
+      H_k1.setTo(H_k);
+      CommonOps_DDRM.addEquals(H_k1, tmp2);
+
+      // Aₖ₊₁ = Aₖ V₁
+      CommonOps_DDRM.mult(A_k, V1, tmp1);
+      A_k.setTo(tmp1);
+
+      // Convergence: ‖Hₖ₊₁ − Hₖ‖_F ≤ 1e-10 ‖Hₖ₊₁‖_F
+      CommonOps_DDRM.subtract(H_k1, H_k, diffH);
+    } while (NormOps_DDRM.normF(diffH) > 1e-10 * NormOps_DDRM.normF(H_k1));
+
+    return H_k1;
   }
 }
