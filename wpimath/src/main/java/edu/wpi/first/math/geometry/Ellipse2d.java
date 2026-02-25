@@ -9,7 +9,6 @@ import static edu.wpi.first.units.Units.Meters;
 import edu.wpi.first.math.Pair;
 import edu.wpi.first.math.geometry.proto.Ellipse2dProto;
 import edu.wpi.first.math.geometry.struct.Ellipse2dStruct;
-import edu.wpi.first.math.jni.Ellipse2dJNI;
 import edu.wpi.first.units.measure.Distance;
 import edu.wpi.first.util.protobuf.ProtobufSerializable;
 import edu.wpi.first.util.struct.StructSerializable;
@@ -224,18 +223,43 @@ public class Ellipse2d implements ProtobufSerializable, StructSerializable {
       return point;
     }
 
-    // Find nearest point
-    var nearestPoint = new double[2];
-    Ellipse2dJNI.nearest(
-        m_center.getX(),
-        m_center.getY(),
-        m_center.getRotation().getRadians(),
-        m_xSemiAxis,
-        m_ySemiAxis,
-        point.getX(),
-        point.getY(),
-        nearestPoint);
-    return new Translation2d(nearestPoint[0], nearestPoint[1]);
+    // Rotate the point by the inverse of the ellipse's rotation so the ellipse is axis-aligned
+    Translation2d rotPoint =
+        point.rotateAround(m_center.getTranslation(), m_center.getRotation().unaryMinus());
+
+    // Find the nearest point on the axis-aligned ellipse via a parametric Newton's method.
+    // Parametrize the ellipse perimeter as x(t) = cx + a*cos(t), y(t) = cy + b*sin(t), then
+    // minimize the squared distance f(t) to rotPoint by solving f'(t) = 0.
+    double cx = m_center.getX();
+    double cy = m_center.getY();
+    double a = m_xSemiAxis;
+    double b = m_ySemiAxis;
+    double dx = rotPoint.getX() - cx;
+    double dy = rotPoint.getY() - cy;
+
+    // Initial parameter: angle of (dx/a, dy/b) maps the query point onto the unit circle
+    double t = Math.atan2(dy / b, dx / a);
+
+    // Newton's method on f'(t)/2 = (b²-a²)·sin(t)·cos(t) + a·dx·sin(t) - b·dy·cos(t)
+    for (int i = 0; i < 50; i++) {
+      double st = Math.sin(t);
+      double ct = Math.cos(t);
+      double b2a2 = b * b - a * a;
+      double fp = b2a2 * st * ct + a * dx * st - b * dy * ct;
+      double fpp = b2a2 * (ct * ct - st * st) + a * dx * ct + b * dy * st;
+      if (Math.abs(fpp) < 1e-12) {
+        break;
+      }
+      double dt = fp / fpp;
+      t -= dt;
+      if (Math.abs(dt) < 1e-12) {
+        break;
+      }
+    }
+
+    // Undo rotation
+    return new Translation2d(cx + a * Math.cos(t), cy + b * Math.sin(t))
+        .rotateAround(m_center.getTranslation(), m_center.getRotation());
   }
 
   @Override

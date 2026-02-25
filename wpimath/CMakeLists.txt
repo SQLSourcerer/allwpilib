@@ -8,7 +8,6 @@ include(DownloadAndCheck)
 file(
     GLOB wpimath_jni_src
     src/main/native/cpp/jni/ArmFeedforwardJNI.cpp
-    src/main/native/cpp/jni/Ellipse2dJNI.cpp
 )
 
 # Java bindings
