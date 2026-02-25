@@ -5,11 +5,6 @@ include(CompileWarnings)
 include(AddTest)
 include(DownloadAndCheck)
 
-file(
-    GLOB wpimath_jni_src
-    src/main/native/cpp/jni/ArmFeedforwardJNI.cpp
-)
-
 # Java bindings
 if(WITH_JAVA)
     include(UseJava)
@@ -56,8 +51,6 @@ if(WITH_JAVA)
     file(GLOB JACKSON_JARS "${WPILIB_BINARY_DIR}/wpiutil/thirdparty/jackson/*.jar")
     file(GLOB QUICKBUF_JAR ${WPILIB_BINARY_DIR}/wpiutil/thirdparty/quickbuf/*.jar)
 
-    set(CMAKE_JNI_TARGET true)
-
     file(GLOB_RECURSE JAVA_SOURCES src/main/java/*.java src/generated/main/java/*.java)
 
     add_jar(
@@ -66,24 +59,11 @@ if(WITH_JAVA)
         INCLUDE_JARS wpiutil_jar wpiunits_jar ${EJML_JARS} ${JACKSON_JARS} ${QUICKBUF_JAR}
         OUTPUT_NAME wpimath
         OUTPUT_DIR ${WPILIB_BINARY_DIR}/${java_lib_dest}
-        GENERATE_NATIVE_HEADERS wpimath_jni_headers
     )
     set_property(TARGET wpimath_jar PROPERTY FOLDER "java")
 
     install_jar(wpimath_jar DESTINATION ${java_lib_dest})
     install_jar_exports(TARGETS wpimath_jar FILE wpimath_jar.cmake DESTINATION share/wpimath)
-
-    add_library(wpimathjni ${wpimath_jni_src})
-    wpilib_target_warnings(wpimathjni)
-    target_link_libraries(wpimathjni PUBLIC wpimath)
-
-    set_property(TARGET wpimathjni PROPERTY FOLDER "libraries")
-
-    target_link_libraries(wpimathjni PRIVATE wpimath_jni_headers)
-    add_dependencies(wpimathjni wpimath_jar)
-
-    install(TARGETS wpimathjni EXPORT wpimathjni)
-    export(TARGETS wpimathjni FILE wpimathjni.cmake NAMESPACE wpimathjni::)
 endif()
 
 if(WITH_JAVA_SOURCE)
@@ -107,7 +87,6 @@ file(
     src/main/native/cpp/*.cpp
     src/main/native/thirdparty/sleipnir/src/*.cpp
 )
-list(REMOVE_ITEM wpimath_native_src ${wpimath_jni_src})
 
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS FALSE)
 

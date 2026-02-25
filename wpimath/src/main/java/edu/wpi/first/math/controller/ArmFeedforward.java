@@ -6,7 +6,6 @@ package edu.wpi.first.math.controller;
 
 import edu.wpi.first.math.controller.proto.ArmFeedforwardProto;
 import edu.wpi.first.math.controller.struct.ArmFeedforwardStruct;
-import edu.wpi.first.math.jni.ArmFeedforwardJNI;
 import edu.wpi.first.util.protobuf.ProtobufSerializable;
 import edu.wpi.first.util.struct.StructSerializable;
 
@@ -213,12 +212,11 @@ public class ArmFeedforward implements ProtobufSerializable, StructSerializable 
    * @return The computed feedforward in volts.
    * @deprecated Use {@link #calculateWithVelocities(double, double, double)} instead.
    */
-  @SuppressWarnings("removal")
   @Deprecated(forRemoval = true, since = "2025")
   public double calculate(
       double currentAngle, double currentVelocity, double nextVelocity, double dt) {
-    return ArmFeedforwardJNI.calculate(
-        ks, kv, ka, kg, currentAngle, currentVelocity, nextVelocity, dt);
+    return new ArmFeedforward(ks, kg, kv, ka, dt)
+        .calculateWithVelocities(currentAngle, currentVelocity, nextVelocity);
   }
 
   /**
@@ -233,8 +231,54 @@ public class ArmFeedforward implements ProtobufSerializable, StructSerializable 
    */
   public double calculateWithVelocities(
       double currentAngle, double currentVelocity, double nextVelocity) {
-    return ArmFeedforwardJNI.calculate(
-        ks, kv, ka, kg, currentAngle, currentVelocity, nextVelocity, m_dt);
+    // Simple closed-form when kA is small (avoids numerical issues in Newton loop).
+    if (ka < 0.1) {
+      return ks * Math.signum(currentVelocity)
+          + kg * Math.cos(currentAngle)
+          + kv * currentVelocity
+          + ka * (nextVelocity - currentVelocity) / m_dt;
+    }
+
+    // RK4 + Newton's method: find u such that integrating arm dynamics for one
+    // timestep with constant voltage u yields omega(t + dt) == nextVelocity.
+    // Initial guess from the closed-form (exact for linear dynamics).
+    double u =
+        ks * Math.signum(currentVelocity)
+            + kg * Math.cos(currentAngle)
+            + kv * currentVelocity
+            + ka * (nextVelocity - currentVelocity) / m_dt;
+
+    double prevAbsG = Double.MAX_VALUE;
+    for (int i = 0; i < 50; i++) {
+      double[] result = rk4ArmAugmented(currentAngle, currentVelocity, u);
+      double omegaNext = result[0];
+      double dOmegaDu = result[1];
+
+      double error = omegaNext - nextVelocity;
+      double cost = error * error;
+      double g = 2.0 * error * dOmegaDu;
+      double H = 2.0 * dOmegaDu * dOmegaDu;
+      double step = -g / Math.max(H, 1e-4);
+
+      // Stop if the gradient is no longer decreasing.
+      if (Math.abs(g) >= (1.0 - 1e-10) * prevAbsG) {
+        break;
+      }
+      prevAbsG = Math.abs(g);
+
+      // Backtracking line search.
+      double alpha = 1.0;
+      for (int j = 0; j < 64; j++) {
+        double[] newResult = rk4ArmAugmented(currentAngle, currentVelocity, u + alpha * step);
+        double newError = newResult[0] - nextVelocity;
+        if (newError * newError <= cost) {
+          break;
+        }
+        alpha *= 0.5;
+      }
+      u += alpha * step;
+    }
+    return u;
   }
 
   // Rearranging the main equation from the calculate() method yields the
@@ -308,6 +352,46 @@ public class ArmFeedforward implements ProtobufSerializable, StructSerializable 
    */
   public double minAchievableAcceleration(double maxVoltage, double angle, double velocity) {
     return maxAchievableAcceleration(-maxVoltage, angle, velocity);
+  }
+
+  /**
+   * Arm dynamics augmented with sensitivity equations.
+   *
+   * <p>State layout: [angle, omega, s_angle, s_omega] where s = d[angle, omega]/du with s(0) =
+   * [0, 0].
+   */
+  private double[] armDynamicsAugmented(double[] x, double u) {
+    double omega = x[1];
+    double sOmega = x[3];
+    return new double[] {
+      omega,
+      -kv / ka * omega + u / ka - Math.signum(omega) * ks / ka - Math.cos(x[0]) * kg / ka,
+      sOmega,
+      -kv / ka * sOmega + 1.0 / ka
+    };
+  }
+
+  /**
+   * Returns [omegaNext, dOmegaNext/du] via one RK4 step of the augmented system.
+   *
+   * <p>This gives the exact derivative dOmegaNext/du at no extra RK4 cost (sensitivity equations).
+   */
+  private double[] rk4ArmAugmented(double angle, double omega, double u) {
+    double h = m_dt;
+    double[] x0 = {angle, omega, 0.0, 0.0};
+    double[] k1 = armDynamicsAugmented(x0, u);
+    double[] x1 = new double[4];
+    for (int j = 0; j < 4; j++) x1[j] = x0[j] + 0.5 * h * k1[j];
+    double[] k2 = armDynamicsAugmented(x1, u);
+    double[] x2 = new double[4];
+    for (int j = 0; j < 4; j++) x2[j] = x0[j] + 0.5 * h * k2[j];
+    double[] k3 = armDynamicsAugmented(x2, u);
+    double[] x3 = new double[4];
+    for (int j = 0; j < 4; j++) x3[j] = x0[j] + h * k3[j];
+    double[] k4 = armDynamicsAugmented(x3, u);
+    double omegaNext = x0[1] + h / 6.0 * (k1[1] + 2 * k2[1] + 2 * k3[1] + k4[1]);
+    double dOmegaDu = x0[3] + h / 6.0 * (k1[3] + 2 * k2[3] + 2 * k3[3] + k4[3]);
+    return new double[] {omegaNext, dOmegaDu};
   }
 
   /** Arm feedforward struct for serialization. */
