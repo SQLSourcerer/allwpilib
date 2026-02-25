@@ -13,10 +13,10 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import edu.wpi.first.math.MatBuilder;
 import edu.wpi.first.math.Matrix;
 import edu.wpi.first.math.Nat;
+import edu.wpi.first.math.VecBuilder;
 import edu.wpi.first.math.geometry.proto.Pose3dProto;
 import edu.wpi.first.math.geometry.struct.Pose3dStruct;
 import edu.wpi.first.math.interpolation.Interpolatable;
-import edu.wpi.first.math.jni.Pose3dJNI;
 import edu.wpi.first.math.numbers.N4;
 import edu.wpi.first.units.measure.Distance;
 import edu.wpi.first.util.protobuf.ProtobufSerializable;
@@ -305,28 +305,41 @@ public class Pose3d implements Interpolatable<Pose3d>, ProtobufSerializable, Str
    * @return The new pose of the robot.
    */
   public Pose3d exp(Twist3d twist) {
-    var quaternion = this.getRotation().getQuaternion();
-    double[] resultArray =
-        Pose3dJNI.exp(
-            this.getX(),
-            this.getY(),
-            this.getZ(),
-            quaternion.getW(),
-            quaternion.getX(),
-            quaternion.getY(),
-            quaternion.getZ(),
-            twist.dx,
-            twist.dy,
-            twist.dz,
-            twist.rx,
-            twist.ry,
-            twist.rz);
-    return new Pose3d(
-        resultArray[0],
-        resultArray[1],
-        resultArray[2],
-        new Rotation3d(
-            new Quaternion(resultArray[3], resultArray[4], resultArray[5], resultArray[6])));
+    // Implementation from Section 3.2 of https://ethaneade.org/lie.pdf
+    double[] u = {twist.dx, twist.dy, twist.dz};
+    double[] rvec = {twist.rx, twist.ry, twist.rz};
+
+    double[][] omega = skew3(rvec);
+    double[][] omegaSq = mat3Mult(omega, omega);
+    double theta = Math.sqrt(rvec[0] * rvec[0] + rvec[1] * rvec[1] + rvec[2] * rvec[2]);
+    double thetaSq = theta * theta;
+
+    double B;
+    double C;
+    if (theta < 1e-7) {
+      // Taylor expansions around θ = 0
+      // B = 1/2! - θ²/4! + θ⁴/6!
+      // C = 1/3! - θ²/5! + θ⁴/7!
+      B = 0.5 - thetaSq / 24.0 + thetaSq * thetaSq / 720.0;
+      C = 1.0 / 6.0 - thetaSq / 120.0 + thetaSq * thetaSq / 5040.0;
+    } else {
+      // B = (1 - cos(θ)) / θ²
+      // C = (1 - sin(θ)/θ) / θ²
+      double A = Math.sin(theta) / theta;
+      B = (1.0 - Math.cos(theta)) / thetaSq;
+      C = (1.0 - A) / thetaSq;
+    }
+
+    // V = I + B·Ω + C·Ω²
+    double[][] V = mat3Add(eye3(), mat3Add(mat3Scale(B, omega), mat3Scale(C, omegaSq)));
+
+    // translation component = V·u
+    double[] t = mat3VecMult(V, u);
+
+    return transformBy(
+        new Transform3d(
+            new Translation3d(t[0], t[1], t[2]),
+            new Rotation3d(VecBuilder.fill(twist.rx, twist.ry, twist.rz))));
   }
 
   /**
@@ -337,31 +350,37 @@ public class Pose3d implements Interpolatable<Pose3d>, ProtobufSerializable, Str
    * @return The twist that maps this to end.
    */
   public Twist3d log(Pose3d end) {
-    var thisQuaternion = this.getRotation().getQuaternion();
-    var endQuaternion = end.getRotation().getQuaternion();
-    double[] resultArray =
-        Pose3dJNI.log(
-            this.getX(),
-            this.getY(),
-            this.getZ(),
-            thisQuaternion.getW(),
-            thisQuaternion.getX(),
-            thisQuaternion.getY(),
-            thisQuaternion.getZ(),
-            end.getX(),
-            end.getY(),
-            end.getZ(),
-            endQuaternion.getW(),
-            endQuaternion.getX(),
-            endQuaternion.getY(),
-            endQuaternion.getZ());
-    return new Twist3d(
-        resultArray[0],
-        resultArray[1],
-        resultArray[2],
-        resultArray[3],
-        resultArray[4],
-        resultArray[5]);
+    // Implementation from Section 3.2 of https://ethaneade.org/lie.pdf
+    var transform = end.relativeTo(this);
+
+    double[] u = {transform.getX(), transform.getY(), transform.getZ()};
+    var rvecVec = transform.getRotation().toVector();
+    double[] rvec = {rvecVec.get(0, 0), rvecVec.get(1, 0), rvecVec.get(2, 0)};
+
+    double[][] omega = skew3(rvec);
+    double[][] omegaSq = mat3Mult(omega, omega);
+    double theta = Math.sqrt(rvec[0] * rvec[0] + rvec[1] * rvec[1] + rvec[2] * rvec[2]);
+    double thetaSq = theta * theta;
+
+    double C;
+    if (theta < 1e-7) {
+      // Taylor expansion around θ = 0
+      // C = 1/6 * (1/2 + θ²/5! + θ⁴/7!)
+      C = 1.0 / 12.0 + thetaSq / 720.0 + thetaSq * thetaSq / 30240.0;
+    } else {
+      // C = (1 - sin(θ)/θ / (2*(1-cos(θ))/θ²)) / θ²
+      double A = Math.sin(theta) / theta;
+      double B = (1.0 - Math.cos(theta)) / thetaSq;
+      C = (1.0 - A / (2.0 * B)) / thetaSq;
+    }
+
+    // V⁻¹ = I - 0.5·Ω + C·Ω²
+    double[][] Vinv = mat3Add(eye3(), mat3Add(mat3Scale(-0.5, omega), mat3Scale(C, omegaSq)));
+
+    // translation component = V⁻¹·u
+    double[] t = mat3VecMult(Vinv, u);
+
+    return new Twist3d(t[0], t[1], t[2], rvec[0], rvec[1], rvec[2]);
   }
 
   /**
@@ -439,6 +458,61 @@ public class Pose3d implements Interpolatable<Pose3d>, ProtobufSerializable, Str
   @Override
   public int hashCode() {
     return Objects.hash(m_translation, m_rotation);
+  }
+
+  // --- 3×3 matrix helpers for SE(3) exp/log ---
+
+  /** Returns the 3×3 skew-symmetric (hat) matrix of a rotation vector [a, b, c]: [0 -c b; c 0 -a; -b a 0]. */
+  private static double[][] skew3(double[] v) {
+    return new double[][] {
+      {0.0, -v[2], v[1]},
+      {v[2], 0.0, -v[0]},
+      {-v[1], v[0], 0.0}
+    };
+  }
+
+  private static double[][] eye3() {
+    return new double[][] {{1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0}};
+  }
+
+  private static double[][] mat3Scale(double s, double[][] M) {
+    double[][] R = new double[3][3];
+    for (int i = 0; i < 3; i++) {
+      for (int j = 0; j < 3; j++) {
+        R[i][j] = s * M[i][j];
+      }
+    }
+    return R;
+  }
+
+  private static double[][] mat3Add(double[][] A, double[][] B) {
+    double[][] R = new double[3][3];
+    for (int i = 0; i < 3; i++) {
+      for (int j = 0; j < 3; j++) {
+        R[i][j] = A[i][j] + B[i][j];
+      }
+    }
+    return R;
+  }
+
+  private static double[][] mat3Mult(double[][] A, double[][] B) {
+    double[][] R = new double[3][3];
+    for (int i = 0; i < 3; i++) {
+      for (int j = 0; j < 3; j++) {
+        for (int k = 0; k < 3; k++) {
+          R[i][j] += A[i][k] * B[k][j];
+        }
+      }
+    }
+    return R;
+  }
+
+  private static double[] mat3VecMult(double[][] M, double[] v) {
+    return new double[] {
+      M[0][0] * v[0] + M[0][1] * v[1] + M[0][2] * v[2],
+      M[1][0] * v[0] + M[1][1] * v[1] + M[1][2] * v[2],
+      M[2][0] * v[0] + M[2][1] * v[1] + M[2][2] * v[2]
+    };
   }
 
   @Override
